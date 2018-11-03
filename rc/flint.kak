@@ -1,21 +1,26 @@
-declare-option -docstring %{shell command to which the path of a copy of the
-    current buffer will be passed The output returned by this command is
-    expected to be a stream of JSON objects with the following fields:
-    "file", "start_line", "start_col", "end_line", "end_col", "kind", "msg",
-    and optionally "fix". If present, "fix" should be an array of objects which
-    each have the fields "start", "length", and "text"} \
-    str flintcmd
+declare-option -docstring %{
+    shell command to which the path of a copy of the current buffer will be 
+    passed The output returned by this command is expected to be a stream of 
+    JSON objects with the following fields: "file", "start_line", "start_col", 
+    "end_line", "end_col", "kind", "msg", and optionally "fix". If present, 
+    "fix" should be an array of objects which each have the fields "start", 
+    "length", and "text"
+} str flintcmd
 
-declare-option -docstring %{color of the error marker in the gutter} \
-    str flint_error_face red
+declare-option -docstring %{
+    color of the error marker in the gutter
+} str flint_error_face red
 
-declare-option -docstring %{color of the warning marker in the gutter} \
-    str flint_warning_face yellow
+declare-option -docstring %{
+    color of the warning marker in the gutter
+} str flint_warning_face yellow
 
 declare-option -hidden line-specs flint_flags
 declare-option -hidden range-specs flint_errors
 declare-option -hidden str-list flint_messages
 declare-option -hidden str-list flint_fixes
+declare-option -hidden range-specs flint_fix
+declare-option -hidden int flint_last_run_timestamp
 declare-option -hidden int flint_error_count
 declare-option -hidden int flint_warning_count
 
@@ -42,15 +47,6 @@ define-command flint -docstring 'Parse the current buffer with a linter' %{
         eval "$kak_opt_flintcmd '$dir'/buf${extension}" \
             | jq '[.,inputs] | sort_by(.start_line)' > "$dir"/stderr
 
-        printf "
-            set-option 'buffer=$kak_buffile' flint_error_count 0
-            set-option 'buffer=$kak_buffile' flint_warning_count 0
-            set-option 'buffer=$kak_buffile' flint_errors
-            set-option 'buffer=$kak_buffile' flint_messages
-            set-option 'buffer=$kak_buffile' flint_fixes
-            set-option 'buffer=$kak_buffile' flint_flags
-        " | kak -p "$kak_session"
-            
         jq --raw-output \
         --arg file "$kak_buffile" --arg stamp "$kak_timestamp" \
         --arg client "$kak_client" --arg errface "$kak_opt_flint_error_face" \
@@ -109,13 +105,27 @@ define-command flint -docstring 'Parse the current buffer with a linter' %{
                         + "\(.key)"
                     ) | join(" ")
                 )
-                evaluate-commands -client \($client) flint-show-counters
+                set-option \"buffer=\($file)\" flint_last_run_timestamp \($stamp)
             "
-        ' < "$dir"/stderr | tee /tmp/err | kak -p "$kak_session"
+        ' < "$dir"/stderr > "$dir"/flint
+
+        (
+            [ "$(stat -c%s "$dir"/flint)" -le 2 ] && printf %s "
+                evaluate-commands -buffer '$kak_buffile' %{
+                    set-option buffer flint_flags $kak_timestamp
+                    set-option buffer flint_error_count 0 
+                    set-option buffer flint_warning_count 0
+                    set-option buffer flint_messages $kak_timestamp
+                    set-option buffer flint_fixes
+                    set-option buffer flint_errors
+                }
+            "
+            cat "$dir"/flint
+        ) | kak -p "$kak_session"
 
         rm -r "$dir"
 
-        } >/dev/null 2>/tmp/err </dev/null &
+        } >/dev/null 2>/dev/null </dev/null &
     }
 }
 
@@ -155,8 +165,9 @@ for err in flint_errors:
     }
 }
 
-define-command -docstring "Apply a quick-fix provided by the linter" flint-fix \
-%{
+define-command -docstring %{
+    Apply a quick-fix provided by the linter
+} flint-fix %{
     update-option buffer flint_errors
     evaluate-commands %sh{
         kakquote() { sed "s/'/''/g;1s/^/'/;\$s/\$/'/" ; }
@@ -172,69 +183,135 @@ import re
 flint_errors = sys.argv[2:]
 line = os.environ['line']
 
-errpat = re.compile(r\"^'(\d+).(\d+),(\d+).(\d+)\|(\d+)'$\")
+errpat = re.compile(r\"^'(\d+).\d+,(\d+).\d+\|(\d+)'$\")
 
 for err in flint_errors:
     match = errpat.match(err)
     if match == None: continue
-    start_line, start_col = match.group(1), match.group(2)
-    end_line, end_col = match.group(3), match.group(4)
-    key = match.group(5)
+    start_line, end_line = match.group(1), match.group(2)
+    key = match.group(3)
     if start_line <= line <= end_line:
-        print('{} {}.{},{}.{}'.format(
-            int(key) + 1, start_line, start_col, start_line, start_col
-        ))
+        print(int(key) + 1)
 
-        " $kak_opt_flint_errors | while read -r key sel; do
+        " $kak_opt_flint_errors | while read -r key; do
             eval "set -- $kak_opt_flint_messages"
-            msg="$(eval "echo \"\$$key\"" | head -c-22 | kakquote)"
+            msg="$(eval "printf '%s\n' \"\$$key\"" | head -c-22 | kakquote)"
             eval "set -- $kak_opt_flint_fixes"
-            fix="$(eval "echo \"\$$key\"")"
+            fix="$(eval "printf '%s\n' \"\$$key\"")"
 
             [ "$fix" = "NOFIX" ] && continue
 
-            printf '%s\n' "$fix" | jq '.' 2> /tmp/err > /tmp/err
+            stamp=$kak_opt_flint_last_run_timestamp
 
-            printf "%s %%{ evaluate-commands -draft -save-regs '\"' %%{" "$msg"
+            printf "\\
+                %s %%{ evaluate-commands -draft %%{
+                    set-option buffer flint_fix $stamp
+            " "$msg"
 
+            # Note: this approach breaks if the selection generated at lint-time
+            # exceeds the bounds of the buffer at fix-time.
             printf '%s\n' "$fix" | jq --raw-output '
-                def kakquote(s): s | "'\''\(gsub("'\''"; "'\'\''"))'\''";
-                .[] | "
+                def kakquote(s): s | "\"\(gsub("\""; "\"\""))\"";
+                def kakescape(s):
+                    s | gsub("%"; "%%") | gsub("#"; "##") | gsub("\n"; "#n")
+                    | gsub("\\|"; "#b");
+                to_entries | .[] | .value.key = .key + 1 | .value | "
                     execute-keys gg \\
                         \(if .start == 0 then "" else "\(.start)l" end) \\
-                        \(if .length >= 1 then "\(.length - 1)L d" else "" end)
-                    set-register %{\"} \(kakquote(.text))
-                    execute-keys P
+                        \(if .length >= 1 then "\(.length - 1)L" else "" end)
+                    set-option -add buffer flint_fix \\
+                        \(kakquote("%val{selection_desc}|\(
+                            .key
+                        ),\(
+                            kakescape(.text)
+                        )"))
                 "
             '
 
-            printf '} }'
+            printf '
+                    flint-apply-fix
+                } } \
+            '
         done
 
         printf '\n'
     }
 }
 
-define-command -hidden flint-show-counters %{
-    echo -markup linting "results:{%opt{flint_error_face}}" \
-        %opt{flint_error_count} "error(s){%opt{flint_error_face}}" \
-        %opt{flint_warning_count} warning(s)
+define-command -hidden flint-apply-fix %{
+    echo -debug BEFORE %sh{ echo "$kak_opt_flint_fix" }
+    update-option buffer flint_fix
+    echo -debug AFTER %sh{ echo "$kak_opt_flint_fix" }
+    evaluate-commands -draft -save-regs '1|"' %sh{
+        kakquote() { sed "s/'/''/g;1s/^/'/;\$s/\$/'/" ; }
+        quote() { sed "s/'/'\\\\''/g;1s/^/'/;\$s/\$/'/" ; }
+
+        unescape() {
+            eval "local str=\"\$$1\""
+            eval "$1=$(printf '%s\n' "$str" | sed 's/##/#/g;s/#b/|/g;s/#n/\n/g' | quote)"
+        }
+        
+        compile() {
+            local start=$1
+            local end=$2
+            local fix="$3"
+
+            printf 'select %s\n' "${start},${end}"
+            printf 'set-register 1 %s\n' "$(printf %s\\n "$fix" | kakquote)"
+
+            if [ $start = $end ]; then
+                printf 'execute-keys \\"1P\n'
+            else
+                printf 'execute-keys \\"1P d\n'
+            fi
+        }
+
+
+        eval "set -- $kak_opt_flint_fix"
+        shift
+
+        for step in "$@"; do
+            sel="$(printf '%s\n' "$step" | cut -d '|' -f 1)"
+            start="$(echo $sel | cut -d ',' -f 1)"
+            end="$(echo $sel | cut -d ',' -f 2)"
+            payload="$(printf '%s\n' "$step" | cut -d '|' -f 2-)"
+            key="$(printf '%s\n' "$payload" | cut -d ',' -f 1)"
+            fix="$(printf '%s\n' "$payload" | cut -d ',' -f 2-)"
+            unescape fix
+            eval "step${key}=$(compile "$start" "$end" "$fix" | quote)"
+        done
+
+        for i in $(seq $#); do
+            eval 'step="$step'"$i"'"'
+            printf '%s\n' "$step"
+        done
+    }
 }
 
-define-command flint-enable -docstring "Activate automatic diagnostics of the code" %{
+define-command -docstring %{
+    Activate automatic diagnostics of the code
+} flint-enable %{
+    flint-disable
     add-highlighter window/flint flag-lines default flint_flags
-    remove-hooks buffer flint-runner
-    hook buffer -group flint-runner NormalIdle .* %{ flint }
-    hook window -group flint-diagnostics NormalIdle .* %{ flint-show }
-    hook window -group flint-diagnostics WinSetOption flint_flags=.* %{ info; flint-show }
+    hook window -group flint-diagnostics NormalIdle .* %{
+        flint-show
+    }
+    hook window -group flint-diagnostics WinSetOption flint_flags=.* %{
+        info
+        flint-show
+    }
 }
 
-define-command flint-disable -docstring "Disable automatic diagnostics of the code" %{
+define-command -docstring %{
+    Disable automatic diagnostics of the code
+} flint-disable %{
     remove-highlighter window/flint
     remove-hooks window flint-diagnostics
 }
 
-define-command flint-next-error -docstring "Jump to the next line that contains an error" %{
+define-command -docstring %{
+    Jump to the next line that contains an error
+} flint-next-error %{
     update-option buffer flint_errors
 
     evaluate-commands %sh{
@@ -258,7 +335,9 @@ define-command flint-next-error -docstring "Jump to the next line that contains 
     }
 }
 
-define-command flint-previous-error -docstring "Jump to the previous line that contains an error" %{
+define-command -docstring %{
+    Jump to the previous line that contains an error
+} flint-previous-error %{
     update-option buffer flint_errors
 
     evaluate-commands %sh{

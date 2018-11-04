@@ -73,3 +73,11 @@ set-option global flint_python3 my_python
 
 And if you want to customize the colors that appear in the gutter and
 and statusline, you can configure `flint_error_face` and `flint_warning_face`.
+
+## Usage
+
+Once flint is configured, run `flint-enable` to display the lint UI elements.
+You can optionally invoke `flint-live-enable` to run the linter automatically
+whenever the buffer content changes. If a lint error message indicates that a
+quickfix is available, you can run `flint-fix` to apply the suggested
+correction.

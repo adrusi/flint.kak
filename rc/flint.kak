@@ -1,16 +1,19 @@
-declare-option -docstring %{shell command to which the path of a copy of the
-    current buffer will be passed The output returned by this command is
-    expected to be a stream of JSON objects with the following fields:
-    "file", "start_line", "start_col", "end_line", "end_col", "kind", "msg",
-    and optionally "fix". If present, "fix" should be an array of objects which
-    each have the fields "start", "length", and "text"} \
-    str flintcmd
+declare-option -docstring %{
+    shell command to which the path of a copy of the current buffer will be
+    passed The output returned by this command is expected to be a stream of
+    JSON objects with the following fields: "file", "start_line", "start_col",
+    "end_line", "end_col", "kind", "msg", and optionally "fix". If present,
+    "fix" should be an array of objects which each have the fields "start",
+    "length", and "text"
+} str flintcmd
 
-declare-option -docstring %{color of the error marker in the gutter} \
-    str flint_error_face red
+declare-option -docstring %{
+    color of the error marker in the gutter
+} str flint_error_face red
 
-declare-option -docstring %{color of the warning marker in the gutter} \
-    str flint_warning_face yellow
+declare-option -docstring %{
+    color of the warning marker in the gutter
+} str flint_warning_face yellow
 
 declare-option -hidden line-specs flint_flags
 declare-option -hidden range-specs flint_errors
@@ -18,6 +21,8 @@ declare-option -hidden str-list flint_messages
 declare-option -hidden str-list flint_fixes
 declare-option -hidden int flint_error_count
 declare-option -hidden int flint_warning_count
+declare-option -hidden int flint_last_run_stamp
+declare-option -hidden int flint_fix_callback_data 
 
 declare-option str flint_python3 python3
 
@@ -42,15 +47,6 @@ define-command flint -docstring 'Parse the current buffer with a linter' %{
         eval "$kak_opt_flintcmd '$dir'/buf${extension}" \
             | jq '[.,inputs] | sort_by(.start_line)' > "$dir"/stderr
 
-        printf "
-            set-option 'buffer=$kak_buffile' flint_error_count 0
-            set-option 'buffer=$kak_buffile' flint_warning_count 0
-            set-option 'buffer=$kak_buffile' flint_errors
-            set-option 'buffer=$kak_buffile' flint_messages
-            set-option 'buffer=$kak_buffile' flint_fixes
-            set-option 'buffer=$kak_buffile' flint_flags
-        " | kak -p "$kak_session"
-            
         jq --raw-output \
         --arg file "$kak_buffile" --arg stamp "$kak_timestamp" \
         --arg client "$kak_client" --arg errface "$kak_opt_flint_error_face" \
@@ -109,13 +105,33 @@ define-command flint -docstring 'Parse the current buffer with a linter' %{
                         + "\(.key)"
                     ) | join(" ")
                 )
-                evaluate-commands -client \($client) flint-show-counters
+                set-option \"buffer=\($file)\" flint_last_run_stamp \($stamp)
             "
-        ' < "$dir"/stderr | tee /tmp/err | kak -p "$kak_session"
+        ' < "$dir"/stderr > "$dir"/flint
+
+        (
+            [ "$(stat -c%s "$dir"/flint)" -le 2 ] && printf %s "
+                evaluate-commands -buffer '$kak_buffile' %{
+                    set-option buffer flint_flags $kak_timestamp
+                    set-option buffer flint_error_count 0 
+                    set-option buffer flint_warning_count 0
+                    set-option buffer flint_messages $kak_timestamp
+                    set-option buffer flint_fixes
+                    set-option buffer flint_errors
+                }
+            "
+            cat "$dir"/flint
+            [ $kak_opt_flint_fix_callback_data -ne 0 ] && printf %s "
+                evaluate-commands -buffer '$kak_buffile' %{
+                    flint-fix-callback $kak_opt_flint_fix_callback_data
+                    set-option buffer flint_fix_callback_data 0
+                }
+            "
+        ) | kak -p "$kak_session"
 
         rm -r "$dir"
 
-        } >/dev/null 2>/tmp/err </dev/null &
+        } >/dev/null 2>/dev/null </dev/null &
     }
 }
 
@@ -155,15 +171,28 @@ for err in flint_errors:
     }
 }
 
-define-command -docstring "Apply a quick-fix provided by the linter" flint-fix \
-%{
-    update-option buffer flint_errors
+define-command -docstring %{
+    Apply a quick-fix provided by the linter
+} flint-fix %{
+    evaluate-commands %sh{
+        if [ $kak_timestamp -eq $kak_opt_last_run_stamp ]; then
+            printf '%s\n' "flint-fix-callback $kak_cursor_line"
+        else
+            printf '%s\n' "
+                set-option -add buffer flint_fix_callback_data $kak_cursor_line
+                flint
+            "
+        fi
+    }
+}
+
+define-command -hidden -params 1 flint-fix-callback %{
     evaluate-commands %sh{
         kakquote() { sed "s/'/''/g;1s/^/'/;\$s/\$/'/" ; }
 
         printf 'menu -auto-single '
 
-        line="$kak_cursor_line" "$kak_opt_flint_python3" -c "
+        line="$1" "$kak_opt_flint_python3" -c "
 
 import sys
 import os
@@ -193,9 +222,7 @@ for err in flint_errors:
 
             [ "$fix" = "NOFIX" ] && continue
 
-            printf '%s\n' "$fix" | jq '.' 2> /tmp/err > /tmp/err
-
-            printf "%s %%{ evaluate-commands -draft -save-regs '\"' %%{" "$msg"
+            printf "%s %%{ evaluate-commands -draft -save-regs 1 %%{" "$msg"
 
             printf '%s\n' "$fix" | jq --raw-output '
                 def kakquote(s): s | "'\''\(gsub("'\''"; "'\'\''"))'\''";
@@ -203,12 +230,12 @@ for err in flint_errors:
                     execute-keys gg \\
                         \(if .start == 0 then "" else "\(.start)l" end) \\
                         \(if .length >= 1 then "\(.length - 1)L d" else "" end)
-                    set-register %{\"} \(kakquote(.text))
-                    execute-keys P
+                    set-register 1 \(kakquote(.text))
+                    execute-keys \\\"1P
                 "
             '
 
-            printf '} }'
+            printf '} } '
         done
 
         printf '\n'
@@ -221,20 +248,45 @@ define-command -hidden flint-show-counters %{
         %opt{flint_warning_count} warning(s)
 }
 
-define-command flint-enable -docstring "Activate automatic diagnostics of the code" %{
+define-command -docstring %{
+    Activate automatic diagnostics of the code
+} flint-enable %{
+    flint-disable
     add-highlighter window/flint flag-lines default flint_flags
-    remove-hooks buffer flint-runner
-    hook buffer -group flint-runner NormalIdle .* %{ flint }
     hook window -group flint-diagnostics NormalIdle .* %{ flint-show }
-    hook window -group flint-diagnostics WinSetOption flint_flags=.* %{ info; flint-show }
+    hook window -group flint-diagnostics WinSetOption flint_flags=.* %{
+        info
+        flint-show
+    }
 }
 
-define-command flint-disable -docstring "Disable automatic diagnostics of the code" %{
+define-command -docstring %{
+    Disable automatic diagnostics of the code
+} flint-disable %{
     remove-highlighter window/flint
     remove-hooks window flint-diagnostics
 }
 
-define-command flint-next-error -docstring "Jump to the next line that contains an error" %{
+define-command -docstring %{
+    Run linter on every buffer change
+} flint-live-enable %{
+    hook window -group flint-live NormalIdle .* %{
+        evaluate-commands %sh{
+            [ $kak_timestamp -eq $kak_opt_flint_last_run_stamp ] && exit
+            printf 'flint\n'
+        }
+    }
+}
+
+define-command -docstring %{
+    Cease live linter running
+} flint-live-disable %{
+    remove-highlighter window flint-live
+}
+
+define-command -docstring %{
+    Jump to the next line that contains an error
+} flint-next-error %{
     update-option buffer flint_errors
 
     evaluate-commands %sh{
@@ -258,7 +310,9 @@ define-command flint-next-error -docstring "Jump to the next line that contains 
     }
 }
 
-define-command flint-previous-error -docstring "Jump to the previous line that contains an error" %{
+define-command -docstring %{
+    Jump to the previous line that contains an error
+} flint-previous-error %{
     update-option buffer flint_errors
 
     evaluate-commands %sh{
